@@ -7,8 +7,12 @@ using UnityEngine.InputSystem;
 /// Cambios respecto a la version original (revision):
 ///  - Ya no se fija la velocidad de golpe: la combi acelera, frena y se
 ///    detiene sola poco a poco (inercia).
-///  - El giro depende de la velocidad: parada no gira (no es un tanque) y en
-///    reversa el volante se invierte, como en un vehiculo real.
+///  - Volante y acelerador analogicos: las teclas no pasan de 0 a 100% en un
+///    cuadro, el volante se mueve y regresa al centro con una rampa.
+///  - Gira sobre su centro (velocidad angular del Rigidbody) y no sobre el
+///    origen del modelo, que en esta combi esta en la defensa delantera.
+///  - El giro depende de la velocidad: parada no gira, en reversa el volante
+///    se invierte y a alta velocidad gira menos (menos nerviosa).
 ///  - "Agarre" lateral: elimina el derrape poco a poco en lugar de borrarlo,
 ///    asi los choques empujan a la combi en vez de ignorarse.
 ///  - Freno de mano con Espacio y soporte para flechas.
@@ -24,7 +28,7 @@ public class CombiController : MonoBehaviour
     public float velocidad = 15f;
     [Tooltip("Velocidad maxima en reversa (m/s)")]
     public float velocidadReversa = 4f;
-    [Tooltip("Grados por segundo a velocidad alta")]
+    [Tooltip("Grados por segundo con el volante a tope")]
     public float velocidadGiro = 70f;
 
     [Header("Aceleracion (m/s por segundo)")]
@@ -36,8 +40,18 @@ public class CombiController : MonoBehaviour
     [Header("Manejo")]
     [Tooltip("Velocidad (m/s) a partir de la cual el giro es completo")]
     public float velocidadGiroCompleto = 6f;
+    [Range(0f, 1f), Tooltip("Giro que queda a velocidad maxima (1 = igual que a baja velocidad)")]
+    public float giroAVelocidadMaxima = 0.55f;
+    [Tooltip("Que tan rapido se mueve el volante al girar (1/s)")]
+    public float respuestaVolante = 3.5f;
+    [Tooltip("Que tan rapido regresa el volante al centro al soltar (1/s)")]
+    public float retornoVolante = 5f;
+    [Tooltip("Que tan rapido responde el pedal (1/s)")]
+    public float respuestaPedal = 4f;
     [Range(0f, 1f), Tooltip("1 = sin derrape, 0 = sobre hielo")]
     public float agarreLateral = 0.9f;
+    [Range(0f, 1f), Tooltip("Agarre lateral con el freno de mano (derrapa mas)")]
+    public float agarreFrenoDeMano = 0.35f;
 
     [Header("Direccion del frente (eje local)")]
     // Largo de la combi: prueba (0,0,1) o (0,0,-1)
@@ -55,6 +69,9 @@ public class CombiController : MonoBehaviour
     /// <summary>Entrada del acelerador: 1 = W, -1 = S, 0 = nada.</summary>
     public float Avance => avance;
 
+    /// <summary>Posicion del volante, -1 (izquierda) a 1 (derecha), ya suavizada.</summary>
+    public float Volante => volante;
+
     /// <summary>Freno de mano (Espacio) presionado.</summary>
     public bool FrenoDeMano => freno;
 
@@ -63,10 +80,15 @@ public class CombiController : MonoBehaviour
         || (avance < 0f && velocidadAdelante > 0.5f)
         || (avance > 0f && velocidadAdelante < -0.5f);
 
+    /// <summary>Centro de la combi en el mundo (el origen del modelo esta en la defensa).</summary>
+    public Vector3 Centro => rb != null ? rb.worldCenterOfMass : transform.position;
+
     Rigidbody rb;
-    float avance;       // 1 = W, -1 = S
-    float giro;         // -1 = A, 1 = D
+    float avance;       // 1 = W, -1 = S (tecla cruda)
+    float giro;         // -1 = A, 1 = D (tecla cruda)
     bool freno;         // Espacio
+    float pedal;        // avance suavizado
+    float volante;      // giro suavizado
     float velocidadAdelante;
 
     void Awake()
@@ -74,14 +96,35 @@ public class CombiController : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         // La combi solo puede girar sobre el eje Y (no se voltea)
         rb.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
+        // Sin interpolacion el cuerpo avanza a saltos de 50 Hz y se ve entrecortado
         rb.interpolation = RigidbodyInterpolation.Interpolate;
         rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
+        rb.angularDamping = 0f;
+
+        // La caja de colision se arrastra sobre el suelo. Con la friccion por
+        // defecto (0.6) el suelo le quita ~0.12 m/s en cada paso de fisica, casi
+        // lo mismo que suma la aceleracion, y la combi se queda en ~0.4 km/h.
+        // El agarre ya lo controla agarreLateral, asi que el contacto va sin friccion.
+        foreach (var col in GetComponentsInChildren<Collider>())
+        {
+            if (col.isTrigger || col.sharedMaterial != null) continue;
+            col.sharedMaterial = MaterialSinFriccion;
+        }
     }
+
+    static PhysicsMaterial materialSinFriccion;
+    static PhysicsMaterial MaterialSinFriccion => materialSinFriccion != null ? materialSinFriccion
+        : materialSinFriccion = new PhysicsMaterial("Combi sin friccion")
+        {
+            dynamicFriction = 0f,
+            staticFriction = 0f,
+            frictionCombine = PhysicsMaterialCombine.Minimum,
+        };
 
     void Update()
     {
         Keyboard teclado = Keyboard.current;
-        if (teclado == null) return;
+        if (teclado == null) { avance = giro = 0f; freno = false; return; }
 
         avance = (Presionada(teclado.wKey, teclado.upArrowKey) ? 1f : 0f)
                - (Presionada(teclado.sKey, teclado.downArrowKey) ? 1f : 0f);
@@ -97,7 +140,16 @@ public class CombiController : MonoBehaviour
     void FixedUpdate()
     {
         float dt = Time.fixedDeltaTime;
-        Vector3 frente = transform.TransformDirection(ejeFrente.normalized);
+
+        // --- Entradas suavizadas: el volante y el pedal no saltan de golpe ---
+        // Si el volante va al lado contrario o regresa al centro, se mueve mas rapido.
+        bool regresando = Mathf.Abs(giro) < 0.01f || Mathf.Sign(giro) != Mathf.Sign(volante);
+        volante = Mathf.MoveTowards(volante, giro, (regresando ? retornoVolante : respuestaVolante) * dt);
+        pedal = Mathf.MoveTowards(pedal, avance, respuestaPedal * dt);
+
+        Vector3 frente = (rb.rotation * ejeFrente).normalized;
+        frente.y = 0f;
+        frente.Normalize();
         Vector3 lado = Vector3.Cross(Vector3.up, frente);
 
         // Descomponer la velocidad real (incluye empujes de choques)
@@ -115,12 +167,12 @@ public class CombiController : MonoBehaviour
         }
         else if (avance > 0f)
         {
-            objetivo = velocidad;
+            objetivo = velocidad * Mathf.Abs(pedal);
             tasa = velocidadAdelante < -0.1f ? frenado : aceleracion;
         }
         else if (avance < 0f)
         {
-            objetivo = -velocidadReversa;
+            objetivo = -velocidadReversa * Mathf.Abs(pedal);
             tasa = velocidadAdelante > 0.1f ? frenado : aceleracion;
         }
         else
@@ -128,19 +180,26 @@ public class CombiController : MonoBehaviour
             objetivo = 0f;
             tasa = desaceleracion;
         }
-        velocidadAdelante = Mathf.MoveTowards(velocidadAdelante, objetivo, tasa * dt);
+        // Cerca de la velocidad objetivo la aceleracion se va suavizando
+        float suave = Mathf.Clamp01(Mathf.Abs(objetivo - velocidadAdelante) / 2f);
+        velocidadAdelante = Mathf.MoveTowards(velocidadAdelante, objetivo, tasa * Mathf.Max(0.25f, suave) * dt);
 
-        // --- Agarre lateral: reduce el derrape sin anularlo de golpe ---
-        velocidadLado = Mathf.Lerp(velocidadLado, 0f, agarreLateral);
+        // --- Agarre lateral, independiente de los FPS de la fisica ---
+        float agarre = freno ? agarreFrenoDeMano : agarreLateral;
+        // agarre 0.9 = quita el 90% del derrape cada 0.02 s
+        float k = -Mathf.Log(Mathf.Max(1e-4f, 1f - agarre)) / 0.02f;
+        velocidadLado *= Mathf.Exp(-k * dt);
 
         Vector3 nuevaVelocidad = frente * velocidadAdelante + lado * velocidadLado;
         nuevaVelocidad.y = v.y;   // conserva la gravedad
         rb.linearVelocity = nuevaVelocidad;
 
-        // --- Giro proporcional a la velocidad e invertido en reversa ---
-        float factorGiro = Mathf.Clamp(velocidadAdelante / velocidadGiroCompleto, -1f, 1f);
-        Quaternion rotacion = Quaternion.Euler(0f, giro * velocidadGiro * factorGiro * dt, 0f);
-        rb.MoveRotation(rotacion * rb.rotation);
-        rb.angularVelocity = Vector3.zero;
+        // --- Giro: sobre el centro de masa, segun la velocidad e invertido en reversa ---
+        float rapidez = Mathf.Abs(velocidadAdelante);
+        float factorGiro = Mathf.Clamp01(rapidez / velocidadGiroCompleto)
+                         * Mathf.Lerp(1f, giroAVelocidadMaxima, Mathf.Clamp01(rapidez / Mathf.Max(0.01f, velocidad)));
+        if (velocidadAdelante < 0f) factorGiro = -factorGiro;
+        float giroGradosPorSegundo = volante * velocidadGiro * factorGiro;
+        rb.angularVelocity = new Vector3(0f, giroGradosPorSegundo * Mathf.Deg2Rad, 0f);
     }
 }

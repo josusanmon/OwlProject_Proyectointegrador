@@ -7,6 +7,8 @@ using UnityEngine;
 ///  - El campo de vision (FOV) se abre con la velocidad: da sensacion de rapidez.
 ///  - Si un edificio/poste queda entre la combi y la camara, la camara se acerca
 ///    en lugar de atravesarlo (SphereCast).
+///  - Sigue el centro de la combi (el origen del modelo esta en la defensa
+///    delantera) y suaviza el giro por separado, asi no copia cada tiron.
 /// </summary>
 [RequireComponent(typeof(Camera))]
 public class CamaraSigueCombi : MonoBehaviour
@@ -23,6 +25,7 @@ public class CamaraSigueCombi : MonoBehaviour
     [Header("Ajustes")]
     public float alturaDeMira = 1.5f;                // punto de la combi al que mira
     public float suavizado = 5f;                     // mas alto = camara mas pegada
+    public float suavizadoGiro = 3f;                 // que tan rapido rodea a la combi al girar
 
     [Header("Campo de vision dinamico")]
     public float fovParado = 60f;
@@ -35,6 +38,8 @@ public class CamaraSigueCombi : MonoBehaviour
 
     Camera cam;
     CombiController combi;
+    float giroSuave;
+    bool iniciada;
 
     void Awake()
     {
@@ -46,10 +51,16 @@ public class CamaraSigueCombi : MonoBehaviour
     {
         if (objetivo == null) return;
 
-        // Solo se usa el giro en Y de la combi, para que la camara no se incline
-        Quaternion giro = Quaternion.Euler(0f, objetivo.eulerAngles.y, 0f);
-        Vector3 puntoMira = objetivo.position + Vector3.up * alturaDeMira;
-        Vector3 posicionDeseada = objetivo.position + giro * desplazamiento;
+        // Solo se usa el giro en Y de la combi, para que la camara no se incline.
+        // El giro se suaviza aparte: la camara rodea a la combi con algo de retraso.
+        float yaw = objetivo.eulerAngles.y;
+        if (!iniciada) { giroSuave = yaw; iniciada = true; }
+        giroSuave = Mathf.LerpAngle(giroSuave, yaw, 1f - Mathf.Exp(-suavizadoGiro * Time.deltaTime));
+        Quaternion giro = Quaternion.Euler(0f, giroSuave, 0f);
+
+        Vector3 centro = combi != null ? combi.Centro : objetivo.position;
+        Vector3 puntoMira = centro + Vector3.up * alturaDeMira;
+        Vector3 posicionDeseada = centro + giro * desplazamiento;
 
         if (evitarObstaculos)
             posicionDeseada = AjustarPorObstaculos(puntoMira, posicionDeseada);

@@ -34,6 +34,7 @@ Juego de conducción de una combi en Unity.
 | Girar izquierda / derecha | A, D / ← → |
 | Freno de mano | Espacio |
 | Encender / apagar faros | L |
+| Mostrar / ocultar controles en pantalla | H |
 
 ## Estado actual
 
